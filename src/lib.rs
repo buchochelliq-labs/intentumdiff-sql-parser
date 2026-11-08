@@ -46,13 +46,8 @@ fn node_to_cst(node: tree_sitter::Node<'_>, source: &[u8]) -> CstNode {
         .collect();
 
     let text = if children.is_empty() {
-        Some(
-            node.utf8_text(source)
-                .unwrap_or("")
-                .chars()
-                .take(4096)
-                .collect(),
-        )
+        // Semantic hashes must include the complete leaf, including long literal tails.
+        Some(node.utf8_text(source).unwrap_or("").to_owned())
     } else {
         None
     };
@@ -141,6 +136,74 @@ mod tests {
     use super::*;
     use crate::exports::intentdiff::plugin::parser::Guest;
     use intentumdiff_plugin_sdk::testing as t;
+
+    fn parse_cst(source: &str) -> CstNode {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_sequel::LANGUAGE.into())
+            .expect("SQL grammar loads");
+        let tree = parser.parse(source, None).expect("SQL parses");
+        assert!(!tree.root_node().has_error(), "valid test SQL: {source}");
+        node_to_cst(tree.root_node(), source.as_bytes())
+    }
+
+    fn semantic_tree(source: &str) -> serde_json::Value {
+        let result: serde_json::Value =
+            serde_json::from_str(&process_impl(source)).expect("semantic JSON");
+        assert!(result.get("error").is_none(), "SQL parses: {result}");
+        assert!(result["structural_hash"].is_string());
+        result
+    }
+
+    #[test]
+    fn long_literal_suffix_changes_survive_semantic_hashing() {
+        for length in [4095, 4096, 4097, 4200, 32768] {
+            let prefix = "a".repeat(length);
+            let old = format!("SELECT '{prefix}x';");
+            let new = format!("SELECT '{prefix}y';");
+            let old_tree = semantic_tree(&old);
+            let new_tree = semantic_tree(&new);
+            assert_ne!(
+                old_tree["structural_hash"], new_tree["structural_hash"],
+                "suffix after {length} characters must affect semantic hash"
+            );
+            assert_eq!(old_tree, semantic_tree(&old), "deterministic parse");
+        }
+    }
+
+    #[test]
+    fn long_literal_retains_full_text_and_byte_span() {
+        for prefix in ["a".repeat(4200), "é界🦀".repeat(1400)] {
+            let literal = format!("'{prefix}x'");
+            let source = format!("SELECT {literal};");
+            let cst = parse_cst(&source);
+            let leaf = cst
+                .walk()
+                .find(|node| node.node_type == "literal" && node.is_leaf())
+                .expect("SQL string literal leaf");
+            assert_eq!(leaf.text.as_deref(), Some(literal.as_str()));
+            assert_eq!((leaf.start_line, leaf.start_col), (0, 7));
+            assert_eq!((leaf.end_line, leaf.end_col), (0, 7 + literal.len() as u32));
+            assert!(source.is_char_boundary(leaf.start_col as usize));
+            assert!(source.is_char_boundary(leaf.end_col as usize));
+        }
+    }
+
+    #[test]
+    fn unicode_literal_suffix_changes_after_character_limit_survive() {
+        let prefix = "é界🦀".repeat(1400);
+        let old = semantic_tree(&format!("SELECT '{prefix}x';"));
+        let new = semantic_tree(&format!("SELECT '{prefix}y';"));
+        assert_ne!(old["structural_hash"], new["structural_hash"]);
+    }
+
+    #[test]
+    fn unchanged_long_literal_keeps_hash_across_spacing() {
+        let literal = format!("'{}x'", "é界🦀".repeat(1400));
+        let old = semantic_tree(&format!("SELECT {literal};"));
+        let new = semantic_tree(&format!("SELECT\n    {literal}\n;"));
+        assert_eq!(old["structural_hash"], new["structural_hash"]);
+    }
 
     #[test]
     fn grammar_id_nonempty() {
